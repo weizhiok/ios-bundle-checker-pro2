@@ -4,11 +4,10 @@ import Foundation
 import Darwin // 必须引入 Darwin 以使用 dlsym
 
 // ========================================================================
-// 🛠️ 核心修复：使用 dlsym 动态调用，彻底绕过编译器 SIL 崩溃
+// 🛠️ 核心修复 V5: 使用裸指针 (RawPointer) 绕过 C 类型检查
 // ========================================================================
 
 // 1. 手动定义 Dl_info 结构体 (C 内存布局)
-// 只有结构体定义，不涉及函数声明，不会冲突
 struct Local_Dl_info {
     var dli_fname: UnsafePointer<CChar>?  // 镜像路径
     var dli_fbase: UnsafeMutableRawPointer? // 镜像基地址
@@ -17,7 +16,6 @@ struct Local_Dl_info {
 }
 
 // 2. 动态调用 dladdr 的封装函数
-// 不再使用 @_silgen_name，而是运行时去内存里找 dladdr 函数
 func safe_dladdr(_ addr: UnsafeRawPointer, _ info: UnsafeMutablePointer<Local_Dl_info>) -> Int32 {
     // RTLD_DEFAULT 在 macOS/iOS 上通常是 -2
     let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
@@ -27,17 +25,21 @@ func safe_dladdr(_ addr: UnsafeRawPointer, _ info: UnsafeMutablePointer<Local_Dl
         return 0
     }
     
-    // 定义 C 函数指针类型
-    typealias DlAddrFunc = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<Local_Dl_info>) -> Int32
+    // 【关键修改】: 将第二个参数定义为 UnsafeMutableRawPointer (裸指针)
+    // 这样编译器就不会抱怨 "Local_Dl_info cannot be used with @convention(c)"
+    typealias DlAddrFunc = @convention(c) (UnsafeRawPointer, UnsafeMutableRawPointer) -> Int32
     
-    // 将指针转换为函数
+    // 将 dlsym 返回的 void* 强转为我们的函数类型
     let dladdr_real = unsafeBitCast(sym, to: DlAddrFunc.self)
     
+    // 将传入的结构体指针转为裸指针
+    let infoRaw = UnsafeMutableRawPointer(info)
+    
     // 执行调用
-    return dladdr_real(addr, info)
+    return dladdr_real(addr, infoRaw)
 }
 
-// 3. Security 函数映射 (这两个通常不会冲突，保持原样)
+// 3. Security 函数映射
 typealias SecTaskRef = AnyObject
 
 @_silgen_name("SecTaskCreateFromSelf")
@@ -77,7 +79,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("BundleID 终极攻防 V4")
+            Text("BundleID 终极攻防 V5")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity)
@@ -199,7 +201,7 @@ struct ContentView: View {
             status: provStatus
         ))
         
-        // --- 7. Runtime 完整性检测 (修正版) ---
+        // --- 7. Runtime 完整性检测 ---
         let (runtimeStatus, runtimeMsg) = checkRuntimeIntegrity()
         items.append(ResultItem(
             method: "7. [Runtime] 方法地址检测",
@@ -297,7 +299,7 @@ struct ContentView: View {
         return "Not Found"
     }
     
-    // --- 实现: Runtime Check (dlsym 版) ---
+    // --- 实现: Runtime Check (dlsym + RawPointer) ---
     func checkRuntimeIntegrity() -> (Bool, String) {
         let selector = #selector(getter: Bundle.bundleIdentifier)
         guard let method = class_getInstanceMethod(Bundle.self, selector) else {
