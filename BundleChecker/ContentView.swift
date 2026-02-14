@@ -1,27 +1,43 @@
 import SwiftUI
 import Security
 import Foundation
-import MachO
-import Darwin // 显式引入 Darwin
+import Darwin // 必须引入 Darwin 以使用 dlsym
 
 // ========================================================================
-// 🛠️ 核心修复区：手动定义 C 结构体与函数映射
+// 🛠️ 核心修复：使用 dlsym 动态调用，彻底绕过编译器 SIL 崩溃
 // ========================================================================
 
 // 1. 手动定义 Dl_info 结构体 (C 内存布局)
-struct Dl_info {
+// 只有结构体定义，不涉及函数声明，不会冲突
+struct Local_Dl_info {
     var dli_fname: UnsafePointer<CChar>?  // 镜像路径
     var dli_fbase: UnsafeMutableRawPointer? // 镜像基地址
     var dli_sname: UnsafePointer<CChar>?  // 符号名称
     var dli_saddr: UnsafeMutableRawPointer? // 符号地址
 }
 
-// 2. 修正 dladdr 定义 (匹配系统 C 签名：参数必须是 Optional)
-// 使用 "sys_dladdr" 作为 Swift 内部名，避免与系统模块的 "dladdr" 冲突导致 SIL 崩溃
-@_silgen_name("dladdr")
-func sys_dladdr(_ addr: UnsafeRawPointer?, _ info: UnsafeMutablePointer<Dl_info>?) -> Int32
+// 2. 动态调用 dladdr 的封装函数
+// 不再使用 @_silgen_name，而是运行时去内存里找 dladdr 函数
+func safe_dladdr(_ addr: UnsafeRawPointer, _ info: UnsafeMutablePointer<Local_Dl_info>) -> Int32 {
+    // RTLD_DEFAULT 在 macOS/iOS 上通常是 -2
+    let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
+    
+    // 动态查找 "dladdr" 符号
+    guard let sym = dlsym(RTLD_DEFAULT, "dladdr") else {
+        return 0
+    }
+    
+    // 定义 C 函数指针类型
+    typealias DlAddrFunc = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<Local_Dl_info>) -> Int32
+    
+    // 将指针转换为函数
+    let dladdr_real = unsafeBitCast(sym, to: DlAddrFunc.self)
+    
+    // 执行调用
+    return dladdr_real(addr, info)
+}
 
-// 3. Security 函数映射
+// 3. Security 函数映射 (这两个通常不会冲突，保持原样)
 typealias SecTaskRef = AnyObject
 
 @_silgen_name("SecTaskCreateFromSelf")
@@ -61,7 +77,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("BundleID 终极攻防 V3")
+            Text("BundleID 终极攻防 V4")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity)
@@ -281,7 +297,7 @@ struct ContentView: View {
         return "Not Found"
     }
     
-    // --- 实现: Runtime Check (修复后) ---
+    // --- 实现: Runtime Check (dlsym 版) ---
     func checkRuntimeIntegrity() -> (Bool, String) {
         let selector = #selector(getter: Bundle.bundleIdentifier)
         guard let method = class_getInstanceMethod(Bundle.self, selector) else {
@@ -289,14 +305,13 @@ struct ContentView: View {
         }
         let imp = method_getImplementation(method)
         
-        // 准备 Dl_info 结构体接收结果
-        var info = Dl_info()
+        // 准备 Local_Dl_info 结构体
+        var info = Local_Dl_info()
         
-        // 调用修正后的 sys_dladdr
-        // 注意：将 IMP 转为 UnsafeRawPointer
+        // 使用动态查找的 safe_dladdr
         let impPtr = UnsafeRawPointer(imp)
         
-        if sys_dladdr(impPtr, &info) != 0 {
+        if safe_dladdr(impPtr, &info) != 0 {
             if let fnamePtr = info.dli_fname {
                 let fname = String(cString: fnamePtr)
                 // 检查镜像路径
